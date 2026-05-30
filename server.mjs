@@ -1,7 +1,7 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
-import { networkInterfaces } from 'os';
+import { networkInterfaces, homedir } from 'os';
 import crypto from 'crypto';
 import { mkdir, readFile, writeFile, rename, appendFile } from 'fs/promises';
 import { existsSync } from 'fs';
@@ -1330,6 +1330,180 @@ app.post('/projects/select', checkAuth, async (req, res) => {
     }
     saveState();
     res.json({ ok: true, selectedProject: STATE.targetProject });
+});
+
+// ── Project Catalog & Remote Opener ──────────────────────────────────────
+// These endpoints expose ALL known projects (not just the 3 open in the IDE)
+// and let mobile users open any project remotely via the antigravity-ide CLI.
+// This bypasses the IDE's 3-concurrent-editor-window limit.
+
+const IDE_PROJECTS_DIR = join(homedir(), '.gemini', 'config', 'projects');
+const IDE_CLI_PATH = join(homedir(), '.antigravity-ide', 'antigravity-ide', 'bin', 'antigravity-ide');
+
+
+/**
+ * Read all projects from the Antigravity IDE config directory.
+ * Returns de-duped project list with folder paths, sorted by name.
+ */
+async function readIDEProjectCatalog() {
+    const { readdir, readFile: readF } = await import('fs/promises');
+    const catalog = new Map(); // folderBaseName -> { id, name, folderUri, folderPath }
+
+    try {
+        const files = await readdir(IDE_PROJECTS_DIR);
+        for (const file of files) {
+            if (!file.endsWith('.json')) continue;
+            try {
+                const raw = await readF(join(IDE_PROJECTS_DIR, file), 'utf-8');
+                const data = JSON.parse(raw);
+                const resources = data?.projectResources?.resources || [];
+                let folderUri = '';
+                for (const r of resources) {
+                    if (r?.gitFolder?.folderUri) {
+                        folderUri = r.gitFolder.folderUri;
+                        break;
+                    }
+                }
+                if (!folderUri) continue;
+                const folderPath = folderUri.replace('file://', '');
+                const baseName = folderPath.split('/').pop();
+                if (!catalog.has(baseName)) {
+                    catalog.set(baseName, {
+                        id: data.id,
+                        name: data.name || baseName,
+                        folderUri,
+                        folderPath,
+                        baseName,
+                    });
+                }
+            } catch (e) { /* skip corrupt files */ }
+        }
+    } catch (e) {
+        log('CATALOG', 'Error reading IDE project configs:', e.message);
+    }
+    return Array.from(catalog.values()).sort((a, b) => a.baseName.localeCompare(b.baseName));
+}
+
+// GET /projects/catalog — list ALL known projects from IDE config + filesystem
+// This returns every project the IDE knows about, regardless of whether it's open.
+app.get('/projects/catalog', checkAuth, async (req, res) => {
+    try {
+        const ideProjects = await readIDEProjectCatalog();
+        const activeWindows = await getAllTargets();
+        const openProjectNames = new Set(
+            activeWindows.map(w => w.projectName).filter(Boolean)
+        );
+
+        const catalog = ideProjects.map(p => ({
+            ...p,
+            isOpen: openProjectNames.has(p.baseName),
+            canOpen: existsSync(IDE_CLI_PATH) && existsSync(p.folderPath),
+        }));
+
+        res.json({
+            ok: true,
+            catalog,
+            totalKnown: catalog.length,
+            totalOpen: activeWindows.length,
+            cliAvailable: existsSync(IDE_CLI_PATH),
+        });
+    } catch (err) {
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+// POST /projects/open — open a project in the IDE via CLI
+// Body: { project: "memflow-cpu" } or { project: "/full/path/to/folder" }
+// Uses -r (reuse window) by default to work within the 3-window limit.
+app.post('/projects/open', checkAuth, async (req, res) => {
+    const { project, newWindow = false } = req.body;
+    if (!project) {
+        return res.status(400).json({ ok: false, error: 'missing_project', hint: '{ project: "project-name" }' });
+    }
+
+    if (!existsSync(IDE_CLI_PATH)) {
+        return res.status(500).json({ ok: false, error: 'cli_not_found', path: IDE_CLI_PATH });
+    }
+
+    // Resolve project name to folder path
+    let folderPath = project;
+    if (!project.startsWith('/')) {
+        // Look up in IDE catalog first
+        const catalog = await readIDEProjectCatalog();
+        const match = catalog.find(p =>
+            p.baseName === project ||
+            p.baseName.toLowerCase() === project.toLowerCase() ||
+            p.name.toLowerCase().startsWith(project.toLowerCase())
+        );
+        if (match) {
+            folderPath = match.folderPath;
+        } else {
+            // Fallback: check ~/Documents/projects/<project>
+            const fallback = join(homedir(), 'Documents', 'projects', project);
+            if (existsSync(fallback)) {
+                folderPath = fallback;
+            } else {
+                return res.status(404).json({
+                    ok: false,
+                    error: 'project_not_found',
+                    project,
+                    hint: 'Use GET /projects/catalog to see available projects',
+                });
+            }
+        }
+    }
+
+    if (!existsSync(folderPath)) {
+        return res.status(404).json({ ok: false, error: 'folder_not_found', folderPath });
+    }
+
+    // Open via CLI
+    const cliArgs = newWindow ? ['-n', folderPath] : ['-r', folderPath];
+    log('PROJECT_OPEN', `Opening ${folderPath} (newWindow=${newWindow})`);
+
+    try {
+        const child = spawn(IDE_CLI_PATH, cliArgs, {
+            detached: true,
+            stdio: 'ignore',
+        });
+        child.unref();
+
+        // Give the IDE a moment to start the language server
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Check if it's now visible
+        const targets = await getAllTargets();
+        const baseName = folderPath.split('/').pop();
+        const isNowOpen = targets.some(t =>
+            t.projectName === baseName ||
+            (t.title && t.title.includes(baseName))
+        );
+
+        // Auto-select the opened project as the active target
+        if (isNowOpen) {
+            const target = targets.find(t =>
+                t.projectName === baseName ||
+                (t.title && t.title.includes(baseName))
+            );
+            if (target) {
+                STATE.targetProject = target;
+                saveState();
+                broadcast('project_selected', { project: target });
+            }
+        }
+
+        res.json({
+            ok: true,
+            project: baseName,
+            folderPath,
+            isNowOpen,
+            newWindow,
+            method: 'cli',
+        });
+    } catch (err) {
+        log('PROJECT_OPEN', `Error opening project: ${err.message}`);
+        res.status(500).json({ ok: false, error: 'open_failed', details: err.message });
+    }
 });
 
 // GET /status (Observability)
