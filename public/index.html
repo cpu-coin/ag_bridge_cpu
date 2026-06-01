@@ -2238,12 +2238,13 @@
           }
           if (data.event === 'approval_decided') fetchApprovals();
           if (data.event === 'message_new') fetchMessages();
-          if (data.event === 'message_ack' && data.data) {
+          if (data.event === 'message_ack' && data.payload) {
             // Update receipt badge in-place (no full re-render needed)
-            var receiptEl = document.getElementById('receipt-' + data.data.id);
+            var ackPayload = data.payload;
+            var receiptEl = document.getElementById('receipt-' + ackPayload.id);
             if (receiptEl) {
-              var rLabel = data.data.receipt || getReceiptLabel(data.data.status);
-              var rColor = data.data.status === 'delivered' ? '#10b981' : data.data.status === 'responded' ? '#3b82f6' : 'var(--text-dim)';
+              var rLabel = ackPayload.receipt || getReceiptLabel(ackPayload.status);
+              var rColor = ackPayload.status === 'delivered' ? '#10b981' : ackPayload.status === 'responded' ? '#3b82f6' : 'var(--text-dim)';
               receiptEl.textContent = rLabel;
               receiptEl.style.color = rColor;
             }

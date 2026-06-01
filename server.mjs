@@ -135,10 +135,9 @@ APPROVAL RULES (IMPORTANT — follow for every tool use that requires user permi
     // STEP 2: CDP Notification (OPTIONAL — just wakes agent)
     // =====================================================
     try {
-        const targets = await getTargetsForProductMode();
+        // CDP wake is product-agnostic — try ALL targets regardless of bridge mode
+        const targets = await getAllTargets();
         if (targets.length > 0) {
-            // Normalize project name for matching: treat hyphens == underscores
-            // The process-scan slug decoder produces underscores; folder names use hyphens.
             const norm = (s) => (s || '').toLowerCase().replace(/[-_]/g, '-');
             const normProject = norm(finalProjectName);
 
@@ -147,12 +146,21 @@ APPROVAL RULES (IMPORTANT — follow for every tool use that requires user permi
                 (t.title && norm(t.title).includes(normProject))
             );
 
-            if (!exactMatch) {
-                // No matching window found — do NOT fall back to targets[0] (wrong project)
-                log('POKE', `CDP notify: no window found for project '${finalProjectName}' — skipping to avoid cross-project delivery`);
+            // Prefer exact match with CDP port; fall back to ANY CDP-capable window.
+            // The message is already in MemFlow — CDP is just a "check your inbox" nudge.
+            let cdpTarget = (exactMatch && exactMatch.port) ? exactMatch : null;
+            if (!cdpTarget) {
+                cdpTarget = targets.find(t => t.port && t.webSocketDebuggerUrl);
+                if (cdpTarget) {
+                    log('POKE', `CDP notify: project '${finalProjectName}' has no CDP port — falling back to '${cdpTarget.title || cdpTarget.projectName}' (port ${cdpTarget.port})`);
+                }
+            }
+
+            if (!cdpTarget) {
+                log('POKE', `CDP notify: no CDP-capable window found — agent must check MemFlow inbox independently`);
             } else {
-                log('POKE', `CDP notify -> ${exactMatch.title || exactMatch.id} (port ${exactMatch.port})`);
-                const cdpResult = await pokeTarget(exactMatch, msgText, pokeMetadata);
+                log('POKE', `CDP notify -> ${cdpTarget.title || cdpTarget.id} (port ${cdpTarget.port})`);
+                const cdpResult = await pokeTarget(cdpTarget, msgText, pokeMetadata);
                 if (cdpResult.ok) {
                     log('POKE', `CDP notify: SUCCESS (${cdpResult.method})`);
                     if (!delivered) {
@@ -2167,18 +2175,23 @@ async function reconcileDelivery() {
             (now - new Date(m.createdAt).getTime()) < MAX_WAKE_AGE
         );
         if (staleSent.length > 0) {
-            // Agent hasn't read from MongoDB yet — try waking it via CDP
-            const targets = await getTargetsForProductMode();
+            // Agent hasn't read from MongoDB yet — try waking it via CDP.
+            // Use getAllTargets() (product-agnostic) with CDP port fallback.
+            const targets = await getAllTargets();
             const projectsToWake = [...new Set(staleSent.map(m => m.targetId).filter(Boolean))];
             const norm = (s) => (s || '').toLowerCase().replace(/[-_]/g, '-');
 
             for (const projName of projectsToWake) {
-                const target = targets.find(t =>
+                // Try exact project match first, then any CDP-capable window
+                let target = targets.find(t =>
                     t.port && (norm(t.projectName) === norm(projName) || (t.title && norm(t.title).includes(norm(projName))))
                 );
+                if (!target) {
+                    target = targets.find(t => t.port && t.webSocketDebuggerUrl);
+                }
                 if (target) {
-                    log('RECONCILE', `Waking agent for '${projName}' via CDP port ${target.port}...`);
-                    const wakeMsg = `[System] You have unread mobile messages. Call mobile_read_inbox to process them.`;
+                    log('RECONCILE', `Waking agent for '${projName}' via CDP port ${target.port} (target: ${target.title || target.projectName})...`);
+                    const wakeMsg = `[System] You have unread mobile messages for project '${projName}'. Call mobile_read_inbox to process them.`;
                     const result = await pokeTarget(target, wakeMsg, { project: projName, from: 'system', channel: 'work' });
                     if (result.ok) {
                         log('RECONCILE', `CDP wake SUCCESS for '${projName}' — agent should now read inbox`);
@@ -2186,7 +2199,7 @@ async function reconcileDelivery() {
                         log('RECONCILE', `CDP wake failed for '${projName}': ${result.error || result.reason || 'unknown'}`);
                     }
                 } else {
-                    log('RECONCILE', `No CDP port found for '${projName}' — agent must be prompted manually`);
+                    log('RECONCILE', `No CDP-capable window found for '${projName}' — agent must check inbox independently`);
                 }
             }
         }
