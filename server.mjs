@@ -135,7 +135,7 @@ APPROVAL RULES (IMPORTANT — follow for every tool use that requires user permi
     // STEP 2: CDP Notification (OPTIONAL — just wakes agent)
     // =====================================================
     try {
-        const targets = await getAllTargets();
+        const targets = await getTargetsForProductMode();
         if (targets.length > 0) {
             // Normalize project name for matching: treat hyphens == underscores
             // The process-scan slug decoder produces underscores; folder names use hyphens.
@@ -265,6 +265,7 @@ function schedulePoke() {
 let STATE = {
     version: 1,
     strictMode: true,
+    bridgeProductMode: 'vibe',
     approvals: [],
     messages: [],
     agent: { state: 'idle', lastSeen: null, task: '', note: '' },
@@ -316,6 +317,21 @@ function getAgentStateForTarget() {
 
 let cachedProductType = null; // null = not yet detected
 
+function normalizeProductMode(mode) {
+    return mode === 'ide' || mode === 'vibe' ? mode : null;
+}
+
+function getBridgeProductMode() {
+    return normalizeProductMode(STATE.bridgeProductMode)
+        || normalizeProductMode(cachedProductType)
+        || 'vibe';
+}
+
+async function getTargetsForProductMode(mode = getBridgeProductMode()) {
+    const normalized = normalizeProductMode(mode) || getBridgeProductMode();
+    return (await getAllTargets()).filter(t => !t.productType || t.productType === normalized);
+}
+
 async function updateCachedProductType() {
     try {
         const targets = await getAllTargets();
@@ -328,6 +344,12 @@ async function updateCachedProductType() {
                     cachedProductType = match.productType;
                     return;
                 }
+            }
+            const preferredMode = normalizeProductMode(STATE.bridgeProductMode);
+            const preferredType = preferredMode ? targets.find(t => t.productType === preferredMode) : null;
+            if (preferredType) {
+                cachedProductType = preferredType.productType;
+                return;
             }
             const withType = targets.find(t => t.productType);
             if (withType) {
@@ -410,7 +432,7 @@ function getTailscaleInfo() {
 function broadcast(event, payload) {
     let finalPayload = payload;
     if (event === 'agent_status') {
-        finalPayload = { ...payload, product: cachedProductType };
+        finalPayload = { ...payload, product: cachedProductType, productMode: getBridgeProductMode() };
     }
     const msg = JSON.stringify({
         event,
@@ -444,6 +466,7 @@ async function saveState() {
             const data = {
                 version: STATE.version,
                 strictMode: STATE.strictMode,
+                bridgeProductMode: getBridgeProductMode(),
                 // approvals: STATE.approvals, // Scoped to approvals.json now
                 messages: STATE.messages,
                 agent: STATE.agent,
@@ -491,6 +514,7 @@ async function loadState() {
 
         if (data.version) STATE.version = data.version;
         if (typeof data.strictMode === 'boolean') STATE.strictMode = data.strictMode;
+        if (normalizeProductMode(data.bridgeProductMode)) STATE.bridgeProductMode = data.bridgeProductMode;
         // if (Array.isArray(data.approvals)) STATE.approvals = data.approvals; // Legacy load
         if (Array.isArray(data.messages)) STATE.messages = data.messages;
         if (data.agent) STATE.agent = data.agent;
@@ -746,6 +770,8 @@ app.get('/config', requireAuth, (req, res) => {
         ok: true,
         strictMode: STATE.strictMode,
         autonomousMode: AUTONOMOUS_MODE,
+        bridgeProductMode: getBridgeProductMode(),
+        detectedProduct: cachedProductType,
         ts: new Date().toISOString()
     });
 });
@@ -760,6 +786,18 @@ app.post('/config/strict-mode', requireAuth, (req, res) => {
     console.log(`[CONFIG] Strict Mode set to ${strictMode}`);
     broadcast('config_changed', { strictMode });
     res.json({ ok: true, strictMode });
+});
+
+app.post('/config/product-mode', requireAuth, (req, res) => {
+    const mode = normalizeProductMode(req.body?.mode);
+    if (!mode) {
+        return res.status(400).json({ error: 'invalid_input', hint: '{ mode: "ide" | "vibe" }' });
+    }
+    STATE.bridgeProductMode = mode;
+    saveState();
+    log('CONFIG', `Bridge product mode set to ${mode}`);
+    broadcast('config_changed', { bridgeProductMode: mode, detectedProduct: cachedProductType });
+    res.json({ ok: true, bridgeProductMode: mode, detectedProduct: cachedProductType });
 });
 
 // Autonomous Mode toggle — session-scoped, never written to disk.
@@ -941,8 +979,8 @@ app.post('/messages/send', checkAuth, async (req, res) => {
     
     // Auto-align targetProject when user submits a message from the mobile UI
     if (from === 'user' && project) {
-        const targets = await getAllTargets();
-        const found = targets.find(t => t.id === project || t.title.includes(project) || t.url?.includes(project) || t.projectName === project);
+        const targets = await getTargetsForProductMode();
+        const found = targets.find(t => t.id === project || t.title?.includes(project) || t.url?.includes(project) || t.projectName === project);
         STATE.targetProject = found || { title: project, projectName: project, connectorId: 'antigravity' };
         saveState();
     }
@@ -1091,6 +1129,7 @@ app.get('/agent/status', checkAuth, (req, res) => {
             ...scoped,
             project: targetKey,
             product: cachedProductType,
+            productMode: getBridgeProductMode(),
             autonomousMode: AUTONOMOUS_MODE
         },
         connection: {
@@ -1160,8 +1199,13 @@ app.get('/projects', checkAuth, async (req, res) => {
             return timeB - timeA;
         });
             
-        // Use Plugin Architecture to scan for Active Windows
-        const activeWindows = await getAllTargets();
+        // Use Plugin Architecture to scan for Active Windows. Product mode is a
+        // hard preference so the UI can switch between Antigravity IDE and Vibe.
+        const bridgeProductMode = getBridgeProductMode();
+        const allActiveWindows = await getAllTargets();
+        const activeWindows = allActiveWindows.filter(w =>
+            !w.productType || w.productType === bridgeProductMode
+        );
         
         // Sort active windows by EXISTING activity BEFORE stamping them.
         // Stamping all with the same "now" makes them equal — sort first, stamp second.
@@ -1184,13 +1228,13 @@ app.get('/projects', checkAuth, async (req, res) => {
         });
         
         // ── History-inferred projects (fallback only) ─────────────────────────
-        // Only add inferred-from-history entries when the live process scan
-        // returned ZERO results (i.e. Antigravity IDE is not currently running).
-        // When the IDE is running, process_scan results are the authoritative list
-        // and we must NOT pollute it with stale historical entries.
-        const hasLiveProcessScanResults = activeWindows.some(w => w.source === 'process_scan');
+        // Only add inferred-from-history entries when the live connector scan
+        // returned ZERO results. CDP-only Antigravity.app windows are live targets
+        // too, so they should not trigger stale history backfill.
+        const hasLiveTargets = activeWindows.length > 0;
+        const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
 
-        if (!hasLiveProcessScanResults) {
+        if (!hasLiveTargets) {
             for (const [proj, timeStr] of Object.entries(projectActivity)) {
                 if (new Date(timeStr).getTime() > oneDayAgo) {
                     if (proj && proj !== 'global' && proj !== '.memflow') {
@@ -1232,16 +1276,44 @@ app.get('/projects', checkAuth, async (req, res) => {
             return tB - tA;
         });
         
-        // Build projectsGrouped: group active conversations by project folder
+        const normProject = (value) => String(value || '').trim().toLowerCase();
+        const openProjectNames = new Set();
+        for (const w of dedupedWindows) {
+            const key = w.projectName || w.title;
+            if (key && key !== 'Launchpad' && projects.includes(key)) {
+                openProjectNames.add(normProject(key));
+            }
+        }
+
+        let activeAgents = [];
+        try {
+            activeAgents = await memflowGetActiveAgents();
+        } catch (_) {}
+        const heartbeatingProjectNames = new Set(
+            activeAgents
+                .map(a => a && a.project)
+                .filter(p => p && projects.includes(p))
+                .map(normProject)
+        );
+
+        // Build projectsGrouped: every known project is selectable; live/open
+        // projects are marked active independently of whether they have messages.
         const projectsGroupedMap = {};
         // Initialize all known project folders
         for (const proj of projects) {
+            const isOpen = openProjectNames.has(normProject(proj));
+            const hasActiveAgent = heartbeatingProjectNames.has(normProject(proj));
             projectsGroupedMap[proj] = {
                 name: proj,
                 conversations: [],
                 lastActivity: projectActivity[proj] || null,
                 messageCount: 0,
-                hasActiveConversations: false
+                hasActiveConversations: isOpen || hasActiveAgent,
+                isOpen,
+                hasActiveAgent,
+                isSelectable: true,
+                canRemoteWork: true,
+                status: isOpen ? 'open' : (hasActiveAgent ? 'agent' : 'closed')
             };
         }
         // Count messages per project
@@ -1273,12 +1345,18 @@ app.get('/projects', checkAuth, async (req, res) => {
             }
             const bucket = projKey || '📡 Global';
             if (!projectsGroupedMap[bucket]) {
+                const isGlobalBucket = bucket === '📡 Global';
                 projectsGroupedMap[bucket] = {
                     name: bucket,
                     conversations: [],
                     lastActivity: null,
                     messageCount: 0,
-                    hasActiveConversations: false
+                    hasActiveConversations: false,
+                    isOpen: false,
+                    hasActiveAgent: false,
+                    isSelectable: !isGlobalBucket,
+                    canRemoteWork: !isGlobalBucket,
+                    status: isGlobalBucket ? 'monitor' : 'closed'
                 };
             }
             projectsGroupedMap[bucket].conversations.push({
@@ -1291,6 +1369,8 @@ app.get('/projects', checkAuth, async (req, res) => {
                 isConversation: w.isConversation || false
             });
             projectsGroupedMap[bucket].hasActiveConversations = true;
+            projectsGroupedMap[bucket].isOpen = true;
+            projectsGroupedMap[bucket].status = bucket === '📡 Global' ? 'monitor' : 'open';
             // Update lastActivity if this window's activity is newer
             const wKey = w.projectName || w.title;
             const wActivity = projectActivity[wKey] || null;
@@ -1310,7 +1390,17 @@ app.get('/projects', checkAuth, async (req, res) => {
             return tB - tA;
         });
 
-        res.json({ ok: true, projectsGrouped, projects, activeWindows: dedupedWindows, activity: projectActivity, selectedProject: STATE.targetProject });
+        res.json({
+            ok: true,
+            projectsGrouped,
+            projects,
+            activeWindows: dedupedWindows,
+            allActiveWindows,
+            bridgeProductMode,
+            detectedProduct: cachedProductType,
+            activity: projectActivity,
+            selectedProject: STATE.targetProject
+        });
     } catch (err) {
         res.status(500).json({ ok: false, error: err.message });
     }
@@ -1322,9 +1412,9 @@ app.post('/projects/select', checkAuth, async (req, res) => {
     if (!project) {
         STATE.targetProject = null;
     } else if (typeof project === 'string') {
-        const targets = await getAllTargets();
-        const found = targets.find(t => t.id === project || t.title.includes(project) || t.url?.includes(project));
-        STATE.targetProject = found || { title: project, connectorId: 'antigravity' };
+        const targets = await getTargetsForProductMode();
+        const found = targets.find(t => t.id === project || t.title?.includes(project) || t.url?.includes(project) || t.projectName === project);
+        STATE.targetProject = found || { title: project, projectName: project, connectorId: 'antigravity', productType: getBridgeProductMode() };
     } else {
         STATE.targetProject = project;
     }
@@ -1339,6 +1429,7 @@ app.post('/projects/select', checkAuth, async (req, res) => {
 
 const IDE_PROJECTS_DIR = join(homedir(), '.gemini', 'config', 'projects');
 const IDE_CLI_PATH = join(homedir(), '.antigravity-ide', 'antigravity-ide', 'bin', 'antigravity-ide');
+const VIBE_CLI_PATH = join(homedir(), '.antigravity', 'antigravity', 'bin', 'antigravity');
 
 
 /**
@@ -1389,7 +1480,8 @@ async function readIDEProjectCatalog() {
 app.get('/projects/catalog', checkAuth, async (req, res) => {
     try {
         const ideProjects = await readIDEProjectCatalog();
-        const activeWindows = await getAllTargets();
+        const mode = getBridgeProductMode();
+        const activeWindows = await getTargetsForProductMode(mode);
         const openProjectNames = new Set(
             activeWindows.map(w => w.projectName).filter(Boolean)
         );
@@ -1397,7 +1489,8 @@ app.get('/projects/catalog', checkAuth, async (req, res) => {
         const catalog = ideProjects.map(p => ({
             ...p,
             isOpen: openProjectNames.has(p.baseName),
-            canOpen: existsSync(IDE_CLI_PATH) && existsSync(p.folderPath),
+            canOpen: existsSync(mode === 'ide' ? IDE_CLI_PATH : VIBE_CLI_PATH) && existsSync(p.folderPath),
+            productMode: mode,
         }));
 
         res.json({
@@ -1405,7 +1498,8 @@ app.get('/projects/catalog', checkAuth, async (req, res) => {
             catalog,
             totalKnown: catalog.length,
             totalOpen: activeWindows.length,
-            cliAvailable: existsSync(IDE_CLI_PATH),
+            productMode: mode,
+            cliAvailable: existsSync(mode === 'ide' ? IDE_CLI_PATH : VIBE_CLI_PATH),
         });
     } catch (err) {
         res.status(500).json({ ok: false, error: err.message });
@@ -1417,12 +1511,14 @@ app.get('/projects/catalog', checkAuth, async (req, res) => {
 // Uses -r (reuse window) by default to work within the 3-window limit.
 app.post('/projects/open', checkAuth, async (req, res) => {
     const { project, newWindow = false } = req.body;
+    const mode = normalizeProductMode(req.body?.mode) || getBridgeProductMode();
+    const cliPath = mode === 'ide' ? IDE_CLI_PATH : VIBE_CLI_PATH;
     if (!project) {
         return res.status(400).json({ ok: false, error: 'missing_project', hint: '{ project: "project-name" }' });
     }
 
-    if (!existsSync(IDE_CLI_PATH)) {
-        return res.status(500).json({ ok: false, error: 'cli_not_found', path: IDE_CLI_PATH });
+    if (!existsSync(cliPath)) {
+        return res.status(500).json({ ok: false, error: 'cli_not_found', productMode: mode, path: cliPath });
     }
 
     // Resolve project name to folder path
@@ -1459,10 +1555,10 @@ app.post('/projects/open', checkAuth, async (req, res) => {
 
     // Open via CLI
     const cliArgs = newWindow ? ['-n', folderPath] : ['-r', folderPath];
-    log('PROJECT_OPEN', `Opening ${folderPath} (newWindow=${newWindow})`);
+    log('PROJECT_OPEN', `Opening ${folderPath} with ${mode} (newWindow=${newWindow})`);
 
     try {
-        const child = spawn(IDE_CLI_PATH, cliArgs, {
+        const child = spawn(cliPath, cliArgs, {
             detached: true,
             stdio: 'ignore',
         });
@@ -1472,7 +1568,7 @@ app.post('/projects/open', checkAuth, async (req, res) => {
         await new Promise(r => setTimeout(r, 2000));
 
         // Check if it's now visible
-        const targets = await getAllTargets();
+        const targets = await getTargetsForProductMode(mode);
         const baseName = folderPath.split('/').pop();
         const isNowOpen = targets.some(t =>
             t.projectName === baseName ||
@@ -1498,6 +1594,7 @@ app.post('/projects/open', checkAuth, async (req, res) => {
             folderPath,
             isNowOpen,
             newWindow,
+            productMode: mode,
             method: 'cli',
         });
     } catch (err) {
@@ -1521,6 +1618,8 @@ app.get('/status', requireAuth, (req, res) => {
             poke_in_flight: pokeInFlight,
             retry_active: !!retryTimer
         },
+        productMode: getBridgeProductMode(),
+        detectedProduct: cachedProductType,
         agent: {
             state: STATE.agent.state,
             last_seen: STATE.agent.lastSeen,
@@ -2069,7 +2168,7 @@ async function reconcileDelivery() {
         );
         if (staleSent.length > 0) {
             // Agent hasn't read from MongoDB yet — try waking it via CDP
-            const targets = await getAllTargets();
+            const targets = await getTargetsForProductMode();
             const projectsToWake = [...new Set(staleSent.map(m => m.targetId).filter(Boolean))];
             const norm = (s) => (s || '').toLowerCase().replace(/[-_]/g, '-');
 

@@ -6,7 +6,7 @@ const STATIC_PORTS = [9000, 9001, 9002, 9003];
 
 // Dynamically detect product type by scanning running processes (no CDP required)
 async function getProductTypeForPid(pid) {
-    if (!pid) return 'ide';
+    if (!pid) return null;
     try {
         const { execSync } = await import('child_process');
         const cmd = execSync(`ps -p ${pid} -o args=`, { encoding: 'utf8', timeout: 1000 }).trim();
@@ -16,7 +16,20 @@ async function getProductTypeForPid(pid) {
             return 'vibe';
         }
     } catch (e) {}
-    return 'ide';
+    return null;
+}
+
+async function getPortOwner(port) {
+    try {
+        const { execSync } = await import('child_process');
+        const out = execSync(`/usr/sbin/lsof -nP -iTCP:${port} -sTCP:LISTEN -Fp 2>/dev/null`, { encoding: 'utf8', timeout: 1000 });
+        const pidLine = out.split('\n').find(line => line.startsWith('p'));
+        const pid = pidLine ? parseInt(pidLine.slice(1), 10) : null;
+        if (!pid) return { pid: null, productType: null };
+        return { pid, productType: await getProductTypeForPid(pid) };
+    } catch (e) {
+        return { pid: null, productType: null };
+    }
 }
 
 /**
@@ -151,9 +164,11 @@ async function getWorkspacesFromProcesses() {
 
 async function discoverPorts() {
     const results = [];
-    // Always include static ports as default fallbacks
+    // Always include static ports as default fallbacks. Resolve the owning PID
+    // when possible because the same debug ports are valid for both products.
     for (const p of STATIC_PORTS) {
-        results.push({ port: p, pid: null, productType: 'ide' });
+        const owner = await getPortOwner(p);
+        results.push({ port: p, pid: owner.pid, productType: owner.productType });
     }
 
     try {
@@ -264,6 +279,7 @@ export async function getTargets() {
                 const isLocalPage = url.startsWith('file://') || url.startsWith('http://localhost') || url.startsWith('https://127.0.0.1');
 
                 if (isWorkbench || isConversation || isLocalPage) {
+                    const productType = d.productType || await getRunningProductType() || 'unknown';
                     const pName = extractProjectName(title);
                     // If process scan already found this project with port=null,
                     // BACKFILL the CDP port onto the existing target (don't skip!)
@@ -274,6 +290,7 @@ export async function getTargets() {
                         existing.webSocketDebuggerUrl = t.webSocketDebuggerUrl;
                         existing.id = t.id;
                         existing.source = 'process_scan+cdp';
+                        existing.productType = existing.productType || productType;
                         continue;
                     }
                     if (pName && seenProjects.has(pName)) continue; // true duplicate
@@ -289,7 +306,7 @@ export async function getTargets() {
                         conversationId: extractConversationId(url),
                         isConversation: url.includes('/c/'),
                         pid: d.pid,
-                        productType: d.productType,
+                        productType,
                         source: 'cdp',
                     });
                 }

@@ -9,7 +9,7 @@ describe('Smoke Test', () => {
         const res = await request(app).get('/health');
         expect(res.status).toBe(200);
         expect(res.body.ok).toBe(true);
-        expect(res.body.name).toBe('ag_bridge');
+        expect(res.body.name).toBe('ag-bridge-cpu');
     });
 
     it('Runtime state (data/state.json) is NOT committed', () => {
