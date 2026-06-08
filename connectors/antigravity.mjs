@@ -560,8 +560,10 @@ export async function poke(target, messageContent) {
     let result = await internalPoke(target, messageContent);
     if (result.ok) return result;
 
-    // Connection or RPC failure — enter self-healing recovery flow
-    console.warn(`[POKE RECOVERY] Delivery failed: ${result.error || 'unknown'}. Re-scanning targets to self-heal...`);
+    // If CDP is not available, just return immediately without spamming logs
+    if (result.error === 'cdp_not_available') {
+        return result;
+    }
     
     try {
         const freshTargets = await getTargets();
@@ -575,7 +577,6 @@ export async function poke(target, messageContent) {
             ) || null; // NO fallback to [0] — wrong project is worse than no delivery
 
             if (match && match.webSocketDebuggerUrl !== target.webSocketDebuggerUrl) {
-                console.log(`[POKE RECOVERY] Recovered active target on port ${match.port}. Retrying connection...`);
                 result = await internalPoke(match, messageContent);
                 if (result.ok) {
                     console.log(`[POKE RECOVERY] Auto-recovery SUCCESS: Connection restored and delivered via port ${match.port}!`);
@@ -584,7 +585,7 @@ export async function poke(target, messageContent) {
             }
         }
     } catch (err) {
-        console.error(`[POKE RECOVERY] Error during self-healing:`, err.message);
+        // Silent recovery fail
     }
 
     // No AppleScript fallback — it's fundamentally unsafe (keystroke injection

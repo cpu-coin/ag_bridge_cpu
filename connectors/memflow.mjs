@@ -291,9 +291,55 @@ export async function getActiveAgents(project) {
         }
 
         const agents = await col.find(query).toArray();
-        return agents;
+        // Return full documents including conversationId and workspaceId if present
+        return agents.map(a => ({
+            agentId:        a.agentId,
+            project:        a.project,
+            state:          a.state,
+            task:           a.task || '',
+            lastSeenAt:     a.lastSeenAt,
+            capabilities:   a.capabilities || [],
+            conversationId: a.conversationId || null,   // IDE conversation UUID for precise CDP routing
+            workspaceId:    a.workspaceId    || null,   // IDE workspace ID
+        }));
     } catch (e) {
         console.error('[MEMFLOW] getActiveAgents error:', e.message);
         return [];
     }
 }
+
+// ── Universal Inbox Scanner (cross-project watchdog) ─────────────────────────
+
+/**
+ * Scan ALL projects' inboxes for messages stuck in 'pending' state.
+ * Unlike checkInboxReceipts (which only checks specific known IDs), this
+ * queries MongoDB directly so it catches messages written by mobile apps,
+ * other agents, or any source that bypasses ag-bridge's STATE.messages.
+ *
+ * @param {number} olderThanMs — only return messages older than this (ms). Default 5 min.
+ * @returns {Promise<Array<{id, project, content, createdAt, channel, metadata}>>}
+ */
+export async function pollAllPendingInbox(olderThanMs = 5 * 60 * 1000) {
+    try {
+        const col = await getCollection();
+        const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+        const docs = await col.find({
+            'coordinates.namespace': INBOX_NAMESPACE,
+            tags: 'pending',
+            createdAt: { $lt: cutoff },
+        }).sort({ createdAt: 1 }).limit(50).toArray();
+
+        return docs.map(doc => ({
+            id:        doc.id,
+            project:   doc.coordinates?.project || doc.metadata?.project || 'global',
+            content:   doc.content,
+            createdAt: doc.createdAt,
+            channel:   doc.metadata?.channel || 'work',
+            metadata:  doc.metadata || {},
+        }));
+    } catch (e) {
+        console.error('[MEMFLOW] pollAllPendingInbox error:', e.message);
+        return [];
+    }
+}
+

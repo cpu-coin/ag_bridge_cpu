@@ -8,7 +8,7 @@ import { existsSync } from 'fs';
 import { spawn, execSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { getAllTargets, pokeTarget, memflowPollResponses, memflowMarkAsRead, memflowReadInbox, memflowWriteResponse, memflowCheckReceipts, memflowGetActiveAgents } from './connectors/index.mjs';
+import { getAllTargets, pokeTarget, memflowPollResponses, memflowMarkAsRead, memflowReadInbox, memflowWriteResponse, memflowCheckReceipts, memflowGetActiveAgents, memflowPollAllPendingInbox } from './connectors/index.mjs';
 import { getRunningProductType } from './connectors/antigravity.mjs';
 
 const APP_VERSION = '2.0.0';
@@ -1514,6 +1514,36 @@ app.get('/projects/catalog', checkAuth, async (req, res) => {
     }
 });
 
+// GET /providers/connections — which AI tools are active per project
+// Returns: { ok, connections: { "project-name": ["claude-code", "cursor", ...] }, providers: [...] }
+// Used by mobile UI to show provider badges on project cards.
+app.get('/providers/connections', checkAuth, async (req, res) => {
+    try {
+        const { getConnections, getTargets } = await import('./connectors/process-scanner.mjs');
+        const [connections, allTargets] = await Promise.all([
+            getConnections(),
+            getTargets(),
+        ]);
+        // Summarize which providers are running globally
+        const providerStatus = {};
+        for (const t of allTargets) {
+            if (!providerStatus[t.tool]) {
+                providerStatus[t.tool] = { tool: t.tool, label: t.toolLabel, running: false, count: 0 };
+            }
+            if (t.running) providerStatus[t.tool].running = true;
+            providerStatus[t.tool].count++;
+        }
+        res.json({
+            ok: true,
+            connections,                         // { projectName: ["claude-code", "cursor"] }
+            providers: Object.values(providerStatus), // global provider summary
+            scannedAt: new Date().toISOString(),
+        });
+    } catch (err) {
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
 // POST /projects/open — open a project in the IDE via CLI
 // Body: { project: "memflow-cpu" } or { project: "/full/path/to/folder" }
 // Uses -r (reuse window) by default to work within the 3-window limit.
@@ -1834,6 +1864,14 @@ app.post('/agent/request-approval', (req, res) => {
     console.log(`[APPROVAL] Agent requested: ${newApproval.id} kind=${kind} cmd=${details?.cmd || '-'}`);
     broadcast('approval_requested', newApproval);
     broadcast('message_new', msg);
+
+    // Bidirectional push: notify mobile regardless of how this approval was initiated.
+    // This fires even if the task was started from terminal/IDE, not from mobile.
+    sendMaitrixPush({
+        title: `⚠️ Approval needed: ${targetProject}`,
+        body:  details?.cmd || kind || 'Agent action requires approval',
+        data:  { project: targetProject, type: 'approval', approvalId: newApproval.id, risk: risk || 'medium' },
+    }).catch(err => log('PUSH', `Approval push failed: ${err.message}`));
 
     // Write approval to MemFlow outbox so mobile app picks it up via polling
     // (WebSocket broadcast alone is unreliable — mobile may not be connected)
@@ -2334,6 +2372,131 @@ setInterval(async () => {
         }
     }
 }, POLL_WATCHDOG_INTERVAL);
+
+// ── FCM / Maitrix Push Notifications ────────────────────────────────────────
+// Bidirectional push: notifies mobile for ANY agent decision, approval, or stuck
+// message — regardless of whether the conversation was initiated from mobile.
+// Set env vars or add to data/config.json: maitrixPushEndpoint + maitrixPushKey
+
+let MAITRIX_PUSH_ENDPOINT = process.env.MAITRIX_PUSH_ENDPOINT || null;
+let MAITRIX_PUSH_KEY      = process.env.MAITRIX_PUSH_KEY      || null;
+
+// Extend startup config loader to pick up Maitrix push settings
+(async () => {
+    try {
+        const cfgPath = join(DATA_DIR, 'config.json');
+        if (existsSync(cfgPath)) {
+            const cfg = JSON.parse(await readFile(cfgPath, 'utf8'));
+            if (cfg.maitrixPushEndpoint) MAITRIX_PUSH_ENDPOINT = cfg.maitrixPushEndpoint;
+            if (cfg.maitrixPushKey)      MAITRIX_PUSH_KEY      = cfg.maitrixPushKey;
+        }
+    } catch (_) {}
+})();
+
+/**
+ * Send a push notification to mobile via Maitrix FCM endpoint.
+ * Falls back to iMessage (sendSMS) if Maitrix push is not configured.
+ * This is the bidirectional notification hook — called for approvals, decisions,
+ * and stuck inbox messages regardless of conversation origin.
+ *
+ * @param {object} opts - { title, body, data: { project, type, messageId, ... } }
+ */
+async function sendMaitrixPush({ title, body, data = {} }) {
+    if (MAITRIX_PUSH_ENDPOINT && MAITRIX_PUSH_KEY) {
+        try {
+            const resp = await fetch(MAITRIX_PUSH_ENDPOINT, {
+                method:  'POST',
+                headers: {
+                    'Content-Type':  'application/json',
+                    'Authorization': `Bearer ${MAITRIX_PUSH_KEY}`,
+                },
+                body: JSON.stringify({ notification: { title, body }, data }),
+            });
+            const json = await resp.json().catch(() => ({}));
+            log('PUSH', `Maitrix push sent [${data.project || '?'}]: "${title}" → ${resp.status}`);
+            return { ok: resp.ok, status: resp.status, response: json };
+        } catch (err) {
+            log('PUSH', `Maitrix push error: ${err.message}`);
+        }
+    }
+    // Fallback: iMessage/SMS via osascript
+    if (ALERT_PHONE) {
+        log('PUSH', `Maitrix push not configured — falling back to SMS for: ${title}`);
+        return sendSMS(ALERT_PHONE, `${title}: ${body}`);
+    }
+    log('PUSH', `No push configured. Add maitrixPushEndpoint+Key to data/config.json. Msg: "${title}"`);
+    return { ok: false, reason: 'not_configured' };
+}
+
+// ── Universal Inbox Watchdog ───────────────────────────────────────────────────
+// Closes the bidirectional notification gap:
+//   - Scans MongoDB for inbox messages pending across ALL projects (not just STATE.messages)
+//   - Catches messages written by any source (mobile, other agents, MCP tools)
+//   - For stuck messages: tries CDP wake + sends Maitrix push to wake mobile
+// This keeps every project moving forward even when conversations aren't mobile-initiated.
+
+const UNIVERSAL_WATCHDOG_INTERVAL  = 30_000;      // check every 30s
+const INBOX_STUCK_THRESHOLD_MS     = 5 * 60_000;  // flag after 5 min pending
+const PUSH_THROTTLE_MS             = 10 * 60_000; // max one push per project per 10 min
+const _pushThrottleMap = new Map(); // projectName → lastPushAt (ms)
+
+async function universalInboxWatchdog() {
+    try {
+        const stuckMessages = await memflowPollAllPendingInbox(INBOX_STUCK_THRESHOLD_MS);
+        if (stuckMessages.length === 0) return;
+
+        log('WATCHDOG', `Universal inbox: ${stuckMessages.length} stuck message(s) across projects`);
+
+        // Group by project
+        const byProject = {};
+        for (const m of stuckMessages) {
+            if (!byProject[m.project]) byProject[m.project] = [];
+            byProject[m.project].push(m);
+        }
+
+        const targets = await getAllTargets();
+        const norm = s => (s || '').toLowerCase().replace(/[-_]/g, '-');
+
+        for (const [projName, msgs] of Object.entries(byProject)) {
+            const ageMin = Math.floor((Date.now() - new Date(msgs[0].createdAt).getTime()) / 60_000);
+            const preview = (msgs[0].content || '').slice(0, 100);
+
+            // Broadcast stuck_inbox event to any connected WebSocket clients
+            broadcast('stuck_inbox', {
+                project:           projName,
+                count:             msgs.length,
+                oldestAgeMinutes:  ageMin,
+                preview,
+            });
+
+            // Try CDP wake — wake the IDE agent so it can read the inbox
+            const cdpTarget =
+                targets.find(t => t.port && (norm(t.projectName) === norm(projName) ||
+                    (t.title && norm(t.title).includes(norm(projName))))) ||
+                targets.find(t => t.port && t.webSocketDebuggerUrl);
+
+            if (cdpTarget) {
+                const wakeMsg = `[System] You have unread mobile messages for project '${projName}'. Call mobile_read_inbox to process them.`;
+                const result = await pokeTarget(cdpTarget, wakeMsg, { project: projName, from: 'system', channel: 'work' });
+                log('WATCHDOG', `CDP wake '${projName}' → ${result.ok ? 'OK' : (result.error || 'failed')}`);
+            }
+
+            // Maitrix push — throttled per project to avoid spam
+            const now = Date.now();
+            const lastPush = _pushThrottleMap.get(projName) || 0;
+            if (now - lastPush > PUSH_THROTTLE_MS) {
+                _pushThrottleMap.set(projName, now);
+                await sendMaitrixPush({
+                    title: `⏳ ${projName} needs input (${ageMin}min)`,
+                    body:  preview || 'Agent is waiting for your response',
+                    data:  { project: projName, type: 'stuck_inbox', count: msgs.length, messageId: msgs[0].id },
+                });
+            }
+        }
+    } catch (e) { /* never crash the server */ }
+}
+
+setInterval(universalInboxWatchdog, UNIVERSAL_WATCHDOG_INTERVAL);
 
 // Patch pollMemflowOutbox to update lastPollSuccess on success
 const _origPollMemflowOutbox = pollMemflowOutbox;

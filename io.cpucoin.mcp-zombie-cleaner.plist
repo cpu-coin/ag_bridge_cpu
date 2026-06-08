@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/seanbarger_1/Documents/projects/ag-bridge-cpu/scripts/mcp-zombie-cleaner.sh</string>
+        <string>/Users/seanbarger_1/.memflow/scripts/mcp-zombie-cleaner.sh</string>
     </array>
 
     <!-- Run every 5 minutes -->
@@ -21,8 +21,8 @@
 
     <!-- Logging -->
     <key>StandardOutPath</key>
-    <string>/dev/null</string>
+    <string>/tmp/zombie-cleaner-stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/dev/null</string>
+    <string>/tmp/zombie-cleaner-stderr.log</string>
 </dict>
 </plist>
